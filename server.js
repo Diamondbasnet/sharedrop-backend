@@ -1,24 +1,26 @@
-﻿require("dotenv").config();
+require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const multer = require("multer");
-const crypto = require("crypto");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
-app.use(cors());
-const port = process.env.PORT || 3000;
-
-app.use(express.json({ limit: "10mb" }));
-
-// Store uploaded files in memory before sending them to Cloudinary.
+const port = Number(process.env.PORT) || 3000;
 const upload = multer({ storage: multer.memoryStorage() });
+const corsOrigin = process.env.CORS_ORIGIN;
 
 const CLIP_TYPE = {
   TEXT: "text",
   FILE: "file",
+};
+
+const cloudinaryConfig = {
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 };
 
 const clipSchema = new mongoose.Schema(
@@ -58,19 +60,37 @@ const clipSchema = new mongoose.Schema(
 
 const Clip = mongoose.model("Clip", clipSchema);
 
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
+cloudinary.config(cloudinaryConfig);
+
+app.use(cors(corsOrigin ? { origin: corsOrigin } : undefined));
+app.use(express.json({ limit: "10mb" }));
+
+app.get("/", (_req, res) => {
+  res.json({
+    service: "sharedrop-backend",
+    status: "ok",
+  });
 });
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+function isCloudinaryConfigured() {
+  return Boolean(
+    cloudinaryConfig.cloud_name &&
+      cloudinaryConfig.api_key &&
+      cloudinaryConfig.api_secret
+  );
+}
 
 function generateCode(length = 6) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const bytes = crypto.randomBytes(length);
   let code = "";
 
-  for (let i = 0; i < length; i += 1) {
-    code += chars[bytes[i] % chars.length];
+  for (let index = 0; index < length; index += 1) {
+    code += chars[bytes[index] % chars.length];
   }
 
   return code;
@@ -103,6 +123,10 @@ function parseExpiryHours(rawHours) {
 }
 
 function uploadBufferToCloudinary(fileBuffer, mimetype, originalName) {
+  if (!isCloudinaryConfigured()) {
+    throw new Error("Cloudinary is not configured.");
+  }
+
   const base64 = fileBuffer.toString("base64");
   const dataUri = `data:${mimetype};base64,${base64}`;
 
@@ -126,6 +150,12 @@ app.post("/api/clip", upload.single("file"), async (req, res) => {
     if ((hasText && hasFile) || (!hasText && !hasFile)) {
       return res.status(400).json({
         error: "Provide exactly one of text content or file upload.",
+      });
+    }
+
+    if (hasFile && !isCloudinaryConfigured()) {
+      return res.status(503).json({
+        error: "File uploads are not configured on this server.",
       });
     }
 
@@ -172,6 +202,7 @@ app.post("/api/clip", upload.single("file"), async (req, res) => {
       fileUrl: clip.type === CLIP_TYPE.FILE ? clip.file.url : null,
     });
   } catch (error) {
+    console.error("Failed to create clip:", error.message);
     return res.status(500).json({ error: "Failed to create clip." });
   }
 });
@@ -213,6 +244,7 @@ app.get("/api/clip/:code", async (req, res) => {
       createdAt: clip.createdAt,
     });
   } catch (error) {
+    console.error("Failed to retrieve clip:", error.message);
     return res.status(500).json({ error: "Failed to retrieve clip." });
   }
 });
@@ -235,20 +267,20 @@ async function startServer() {
       throw new Error("MONGODB_URI is not set.");
     }
 
-    const cloudinaryConfigMissing =
-      !process.env.CLOUDINARY_CLOUD_NAME ||
-      !process.env.CLOUDINARY_API_KEY ||
-      !process.env.CLOUDINARY_API_SECRET;
-
-    if (cloudinaryConfigMissing) {
-      throw new Error("Cloudinary environment variables are not fully set.");
-    }
-
-    await mongoose.connect(mongoUri);
+    await mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 10000,
+    });
     console.log("Connected to MongoDB.");
 
+    if (!isCloudinaryConfigured()) {
+      console.warn(
+        "Cloudinary environment variables are not fully set. File uploads are disabled until they are configured."
+      );
+    }
+
     await cleanupExpiredClips();
-    setInterval(cleanupExpiredClips, 60 * 60 * 1000);
+    const cleanupInterval = setInterval(cleanupExpiredClips, 60 * 60 * 1000);
+    cleanupInterval.unref();
 
     app.listen(port, () => {
       console.log(`ShareDrop backend listening on port ${port}`);
@@ -260,4 +292,3 @@ async function startServer() {
 }
 
 startServer();
-

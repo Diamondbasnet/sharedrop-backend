@@ -1,0 +1,7 @@
+$RECYCLE.BIN/
+System Volume Information/
+node_modules/
+.env
+.env.local
+npm-debug.log*
+Thumbs.db
