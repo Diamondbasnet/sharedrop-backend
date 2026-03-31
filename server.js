@@ -122,6 +122,30 @@ function parseExpiryHours(rawHours) {
   return parsed;
 }
 
+function getRequestText(body = {}) {
+  if (typeof body.text === "string" && body.text.trim().length > 0) {
+    return body.text.trim();
+  }
+
+  if (typeof body.content === "string" && body.content.trim().length > 0) {
+    return body.content.trim();
+  }
+
+  return "";
+}
+
+function getRequestExpiryHours(body = {}) {
+  if (body.expiryHours !== undefined) {
+    return body.expiryHours;
+  }
+
+  if (body.expiry_hours !== undefined) {
+    return body.expiry_hours;
+  }
+
+  return undefined;
+}
+
 function uploadBufferToCloudinary(fileBuffer, mimetype, originalName) {
   if (!isCloudinaryConfigured()) {
     throw new Error("Cloudinary is not configured.");
@@ -141,10 +165,11 @@ function uploadBufferToCloudinary(fileBuffer, mimetype, originalName) {
 
 app.post("/api/clip", upload.single("file"), async (req, res) => {
   try {
-    const { text, expiryHours } = req.body;
+    const textContent = getRequestText(req.body);
+    const expiryHours = getRequestExpiryHours(req.body);
     const uploadedFile = req.file;
 
-    const hasText = typeof text === "string" && text.trim().length > 0;
+    const hasText = textContent.length > 0;
     const hasFile = Boolean(uploadedFile);
 
     if ((hasText && hasFile) || (!hasText && !hasFile)) {
@@ -190,7 +215,7 @@ app.post("/api/clip", upload.single("file"), async (req, res) => {
         publicId: cloudinaryResult.public_id,
       };
     } else {
-      clipData.textContent = text;
+      clipData.textContent = textContent;
     }
 
     const clip = await Clip.create(clipData);
@@ -226,6 +251,7 @@ app.get("/api/clip/:code", async (req, res) => {
         code: clip.code,
         type: clip.type,
         text: clip.textContent,
+        content: clip.textContent,
         expiresAt: clip.expiresAt,
         createdAt: clip.createdAt,
       });
@@ -234,6 +260,7 @@ app.get("/api/clip/:code", async (req, res) => {
     return res.json({
       code: clip.code,
       type: clip.type,
+      fileUrl: clip.file.url,
       file: {
         filename: clip.file.filename,
         mimetype: clip.file.mimetype,
