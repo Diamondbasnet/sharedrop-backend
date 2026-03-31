@@ -1,12 +1,14 @@
-require("dotenv").config();
+﻿require("dotenv").config();
 
 const express = require("express");
+const cors = require("cors");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const crypto = require("crypto");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
+app.use(cors());
 const port = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "10mb" }));
@@ -258,3 +260,4 @@ async function startServer() {
 }
 
 startServer();
+
