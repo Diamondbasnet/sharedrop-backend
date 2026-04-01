@@ -18,6 +18,7 @@ const CLIP_TYPE = {
 };
 
 const CLOUDINARY_RESOURCE_TYPES = ["image", "video", "raw"];
+const CLEANUP_INTERVAL_MS = 60 * 1000;
 
 const cloudinaryConfig = {
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -402,7 +403,7 @@ async function startServer() {
     }
 
     await cleanupExpiredClips();
-    const cleanupInterval = setInterval(cleanupExpiredClips, 60 * 60 * 1000);
+    const cleanupInterval = setInterval(cleanupExpiredClips, CLEANUP_INTERVAL_MS);
     cleanupInterval.unref();
 
     app.listen(port, () => {
