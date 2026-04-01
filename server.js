@@ -9,8 +9,24 @@ const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
-const upload = multer({ storage: multer.memoryStorage() });
 const corsOrigin = process.env.CORS_ORIGIN;
+const MAX_UPLOAD_SIZE_MB = Number(process.env.MAX_UPLOAD_SIZE_MB) || 25;
+const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "1mb";
+const MIN_EXPIRY_HOURS = 1 / 60;
+const MAX_EXPIRY_HOURS = 7 * 24;
+const CREATE_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const CREATE_RATE_LIMIT_MAX = Number(process.env.CREATE_RATE_LIMIT_MAX) || 30;
+const FETCH_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const FETCH_RATE_LIMIT_MAX = Number(process.env.FETCH_RATE_LIMIT_MAX) || 240;
+const RATE_LIMITER_CACHE_LIMIT = 5000;
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_UPLOAD_SIZE_BYTES,
+    files: 1,
+  },
+});
 
 const CLIP_TYPE = {
   TEXT: "text",
@@ -19,6 +35,7 @@ const CLIP_TYPE = {
 
 const CLOUDINARY_RESOURCE_TYPES = ["image", "video", "raw"];
 const CLEANUP_INTERVAL_MS = 60 * 1000;
+const rateLimitStore = new Map();
 
 const cloudinaryConfig = {
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -66,8 +83,130 @@ const Clip = mongoose.model("Clip", clipSchema);
 
 cloudinary.config(cloudinaryConfig);
 
-app.use(cors(corsOrigin ? { origin: corsOrigin } : undefined));
-app.use(express.json({ limit: "10mb" }));
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+function parseAllowedOrigins(rawOrigins) {
+  if (!rawOrigins) {
+    return [];
+  }
+
+  return rawOrigins
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const allowedOrigins = parseAllowedOrigins(corsOrigin);
+
+function createCorsOptions() {
+  if (allowedOrigins.length === 0) {
+    if (process.env.NODE_ENV === "production") {
+      return { origin: false };
+    }
+
+    return undefined;
+  }
+
+  return {
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error("Origin not allowed by CORS"));
+    },
+  };
+}
+
+function getClientIdentifier(req) {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  const forwardedValue = Array.isArray(forwardedFor)
+    ? forwardedFor[0]
+    : forwardedFor?.split(",")[0];
+
+  return (req.ip || forwardedValue || "unknown").trim();
+}
+
+function pruneRateLimitStore(now) {
+  if (rateLimitStore.size < RATE_LIMITER_CACHE_LIMIT) {
+    return;
+  }
+
+  for (const [key, entry] of rateLimitStore.entries()) {
+    if (entry.resetAt <= now) {
+      rateLimitStore.delete(key);
+    }
+  }
+
+  while (rateLimitStore.size >= RATE_LIMITER_CACHE_LIMIT) {
+    const oldestKey = rateLimitStore.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+
+    rateLimitStore.delete(oldestKey);
+  }
+}
+
+function createRateLimiter({ scope, windowMs, maxRequests }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    pruneRateLimitStore(now);
+
+    const key = `${scope}:${getClientIdentifier(req)}`;
+    const currentEntry = rateLimitStore.get(key);
+
+    if (!currentEntry || currentEntry.resetAt <= now) {
+      rateLimitStore.set(key, {
+        count: 1,
+        resetAt: now + windowMs,
+      });
+      next();
+      return;
+    }
+
+    if (currentEntry.count >= maxRequests) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((currentEntry.resetAt - now) / 1000)
+      );
+      res.set("Retry-After", String(retryAfterSeconds));
+      res.status(429).json({
+        error: "Too many requests. Please try again later.",
+      });
+      return;
+    }
+
+    currentEntry.count += 1;
+    next();
+  };
+}
+
+const createClipRateLimiter = createRateLimiter({
+  scope: "create-clip",
+  windowMs: CREATE_RATE_LIMIT_WINDOW_MS,
+  maxRequests: CREATE_RATE_LIMIT_MAX,
+});
+
+const fetchClipRateLimiter = createRateLimiter({
+  scope: "fetch-clip",
+  windowMs: FETCH_RATE_LIMIT_WINDOW_MS,
+  maxRequests: FETCH_RATE_LIMIT_MAX,
+});
+
+app.use(cors(createCorsOptions()));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+app.use((_req, res, next) => {
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("Referrer-Policy", "no-referrer");
+  next();
+});
+app.use("/api/clip", (_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
 
 app.get("/", (_req, res) => {
   res.json({
@@ -119,11 +258,19 @@ function parseExpiryHours(rawHours) {
   }
 
   const parsed = Number(rawHours);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  if (
+    !Number.isFinite(parsed) ||
+    parsed < MIN_EXPIRY_HOURS ||
+    parsed > MAX_EXPIRY_HOURS
+  ) {
     return null;
   }
 
   return parsed;
+}
+
+function isValidClipCode(value) {
+  return typeof value === "string" && /^[A-Za-z0-9]{6}$/.test(value);
 }
 
 function getRequestText(body = {}) {
@@ -243,7 +390,7 @@ async function deleteExpiredClip(clip) {
   return true;
 }
 
-app.post("/api/clip", upload.single("file"), async (req, res) => {
+app.post("/api/clip", createClipRateLimiter, upload.single("file"), async (req, res) => {
   try {
     const textContent = getRequestText(req.body);
     const expiryHours = getRequestExpiryHours(req.body);
@@ -267,7 +414,7 @@ app.post("/api/clip", upload.single("file"), async (req, res) => {
     const hours = parseExpiryHours(expiryHours);
     if (hours === null) {
       return res.status(400).json({
-        error: "expiryHours must be a positive number.",
+        error: "expiryHours must be between 1 minute and 7 days.",
       });
     }
 
@@ -313,9 +460,13 @@ app.post("/api/clip", upload.single("file"), async (req, res) => {
   }
 });
 
-app.get("/api/clip/:code", async (req, res) => {
+app.get("/api/clip/:code", fetchClipRateLimiter, async (req, res) => {
   try {
     const { code } = req.params;
+    if (!isValidClipCode(code)) {
+      return res.status(400).json({ error: "Invalid clip code." });
+    }
+
     const clip = await Clip.findOne({ code });
 
     if (!clip) {
@@ -383,6 +534,24 @@ async function cleanupExpiredClips() {
     console.error("Cleanup job failed:", error.message);
   }
 }
+
+app.use((error, _req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        error: `File size exceeds the ${MAX_UPLOAD_SIZE_MB} MB limit.`,
+      });
+    }
+
+    return res.status(400).json({ error: "Invalid file upload." });
+  }
+
+  if (error?.message === "Origin not allowed by CORS") {
+    return res.status(403).json({ error: "Origin not allowed." });
+  }
+
+  return next(error);
+});
 
 async function startServer() {
   try {
