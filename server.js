@@ -17,6 +17,8 @@ const CLIP_TYPE = {
   FILE: "file",
 };
 
+const CLOUDINARY_RESOURCE_TYPES = ["image", "video", "raw"];
+
 const cloudinaryConfig = {
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -48,6 +50,7 @@ const clipSchema = new mongoose.Schema(
       size: { type: Number, default: null },
       url: { type: String, default: null },
       publicId: { type: String, default: null },
+      resourceType: { type: String, default: null },
     },
     expiresAt: {
       type: Date,
@@ -163,6 +166,82 @@ function uploadBufferToCloudinary(fileBuffer, mimetype, originalName) {
   });
 }
 
+function getCloudinaryResourceTypes(resourceType) {
+  if (!resourceType) {
+    return CLOUDINARY_RESOURCE_TYPES;
+  }
+
+  return [
+    resourceType,
+    ...CLOUDINARY_RESOURCE_TYPES.filter((type) => type !== resourceType),
+  ];
+}
+
+async function destroyCloudinaryFile(publicId, resourceType) {
+  if (!publicId) {
+    return true;
+  }
+
+  if (!isCloudinaryConfigured()) {
+    console.warn(
+      `Skipping Cloudinary cleanup for ${publicId} because Cloudinary is not configured.`
+    );
+    return false;
+  }
+
+  let lastError = null;
+
+  for (const currentResourceType of getCloudinaryResourceTypes(resourceType)) {
+    try {
+      const result = await cloudinary.uploader.destroy(publicId, {
+        resource_type: currentResourceType,
+      });
+
+      if (result.result === "ok" || result.result === "deleted") {
+        return true;
+      }
+
+      if (result.result !== "not found") {
+        console.warn(
+          `Unexpected Cloudinary destroy result for ${publicId}: ${result.result}`
+        );
+      }
+    } catch (error) {
+      lastError = error;
+      console.error(
+        `Failed to delete Cloudinary asset ${publicId} as ${currentResourceType}:`,
+        error.message
+      );
+    }
+  }
+
+  if (lastError) {
+    return false;
+  }
+
+  return true;
+}
+
+async function deleteExpiredClip(clip) {
+  if (!clip) {
+    return false;
+  }
+
+  if (clip.type === CLIP_TYPE.FILE) {
+    const remoteDeleted = await destroyCloudinaryFile(
+      clip.file?.publicId,
+      clip.file?.resourceType
+    );
+
+    if (!remoteDeleted) {
+      return false;
+    }
+  }
+
+  await Clip.deleteOne({ _id: clip._id });
+  return true;
+}
+
 app.post("/api/clip", upload.single("file"), async (req, res) => {
   try {
     const textContent = getRequestText(req.body);
@@ -213,6 +292,7 @@ app.post("/api/clip", upload.single("file"), async (req, res) => {
         size: uploadedFile.size,
         url: cloudinaryResult.secure_url,
         publicId: cloudinaryResult.public_id,
+        resourceType: cloudinaryResult.resource_type ?? null,
       };
     } else {
       clipData.textContent = textContent;
@@ -242,7 +322,10 @@ app.get("/api/clip/:code", async (req, res) => {
     }
 
     if (clip.expiresAt <= new Date()) {
-      await Clip.deleteOne({ _id: clip._id });
+      const deleted = await deleteExpiredClip(clip);
+      if (!deleted) {
+        console.warn(`Expired clip ${clip.code} could not be fully cleaned up yet.`);
+      }
       return res.status(404).json({ error: "Clip has expired." });
     }
 
@@ -278,9 +361,22 @@ app.get("/api/clip/:code", async (req, res) => {
 
 async function cleanupExpiredClips() {
   try {
-    const result = await Clip.deleteMany({ expiresAt: { $lte: new Date() } });
-    if (result.deletedCount > 0) {
-      console.log(`Cleanup job removed ${result.deletedCount} expired clips.`);
+    const expiredClips = await Clip.find({ expiresAt: { $lte: new Date() } });
+    let deletedCount = 0;
+
+    for (const clip of expiredClips) {
+      // Retry later if remote file cleanup fails.
+      // eslint-disable-next-line no-await-in-loop
+      const deleted = await deleteExpiredClip(clip);
+      if (deleted) {
+        deletedCount += 1;
+      } else if (clip.type === CLIP_TYPE.FILE) {
+        console.warn(`Cleanup job will retry expired file clip ${clip.code}.`);
+      }
+    }
+
+    if (deletedCount > 0) {
+      console.log(`Cleanup job removed ${deletedCount} expired clips.`);
     }
   } catch (error) {
     console.error("Cleanup job failed:", error.message);
