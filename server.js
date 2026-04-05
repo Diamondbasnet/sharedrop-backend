@@ -12,6 +12,7 @@ const port = Number(process.env.PORT) || 3000;
 const corsOrigin = process.env.CORS_ORIGIN;
 const MAX_UPLOAD_SIZE_MB = Number(process.env.MAX_UPLOAD_SIZE_MB) || 25;
 const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
+const MAX_FILES_PER_CLIP = Number(process.env.MAX_FILES_PER_CLIP) || 10;
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "1mb";
 const MIN_EXPIRY_HOURS = 1 / 60;
 const MAX_EXPIRY_HOURS = 7 * 24;
@@ -24,7 +25,7 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: MAX_UPLOAD_SIZE_BYTES,
-    files: 1,
+    files: MAX_FILES_PER_CLIP,
   },
 });
 
@@ -42,6 +43,18 @@ const cloudinaryConfig = {
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 };
+
+const storedFileSchema = new mongoose.Schema(
+  {
+    filename: { type: String, default: null },
+    mimetype: { type: String, default: null },
+    size: { type: Number, default: null },
+    url: { type: String, default: null },
+    publicId: { type: String, default: null },
+    resourceType: { type: String, default: null },
+  },
+  { _id: false }
+);
 
 const clipSchema = new mongoose.Schema(
   {
@@ -63,12 +76,12 @@ const clipSchema = new mongoose.Schema(
       default: null,
     },
     file: {
-      filename: { type: String, default: null },
-      mimetype: { type: String, default: null },
-      size: { type: Number, default: null },
-      url: { type: String, default: null },
-      publicId: { type: String, default: null },
-      resourceType: { type: String, default: null },
+      type: storedFileSchema,
+      default: null,
+    },
+    files: {
+      type: [storedFileSchema],
+      default: undefined,
     },
     expiresAt: {
       type: Date,
@@ -297,20 +310,82 @@ function getRequestExpiryHours(body = {}) {
   return undefined;
 }
 
+function resolveCloudinaryResourceType(mimetype = "") {
+  if (mimetype.startsWith("image/")) {
+    return "image";
+  }
+
+  if (mimetype.startsWith("video/") || mimetype.startsWith("audio/")) {
+    return "video";
+  }
+
+  return "raw";
+}
+
+function getUploadedFiles(req) {
+  const requestFiles = req.files;
+
+  if (!requestFiles) {
+    return [];
+  }
+
+  if (Array.isArray(requestFiles)) {
+    return requestFiles;
+  }
+
+  return [...(requestFiles.files || []), ...(requestFiles.file || [])];
+}
+
+function getClipFiles(clip) {
+  if (Array.isArray(clip?.files) && clip.files.length > 0) {
+    return clip.files;
+  }
+
+  if (clip?.file?.url) {
+    return [clip.file];
+  }
+
+  return [];
+}
+
+function formatFileResponse(file) {
+  if (!file) {
+    return null;
+  }
+
+  return {
+    filename: file.filename,
+    mimetype: file.mimetype,
+    size: file.size,
+    url: file.url,
+  };
+}
+
 function uploadBufferToCloudinary(fileBuffer, mimetype, originalName) {
   if (!isCloudinaryConfigured()) {
     throw new Error("Cloudinary is not configured.");
   }
 
-  const base64 = fileBuffer.toString("base64");
-  const dataUri = `data:${mimetype};base64,${base64}`;
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: resolveCloudinaryResourceType(mimetype),
+        folder: "sharedrop",
+        use_filename: true,
+        unique_filename: true,
+        filename_override: originalName,
+      },
+      (error, result) => {
+        if (error) {
+          reject(error);
+          return;
+        }
 
-  return cloudinary.uploader.upload(dataUri, {
-    resource_type: "auto",
-    folder: "sharedrop",
-    use_filename: true,
-    unique_filename: true,
-    filename_override: originalName,
+        resolve(result);
+      }
+    );
+
+    uploadStream.end(fileBuffer);
   });
 }
 
@@ -376,13 +451,19 @@ async function deleteExpiredClip(clip) {
   }
 
   if (clip.type === CLIP_TYPE.FILE) {
-    const remoteDeleted = await destroyCloudinaryFile(
-      clip.file?.publicId,
-      clip.file?.resourceType
-    );
+    const clipFiles = getClipFiles(clip);
 
-    if (!remoteDeleted) {
-      return false;
+    for (const file of clipFiles) {
+      // Retry later if any remote file cleanup fails.
+      // eslint-disable-next-line no-await-in-loop
+      const remoteDeleted = await destroyCloudinaryFile(
+        file?.publicId,
+        file?.resourceType
+      );
+
+      if (!remoteDeleted) {
+        return false;
+      }
     }
   }
 
@@ -390,75 +471,114 @@ async function deleteExpiredClip(clip) {
   return true;
 }
 
-app.post("/api/clip", createClipRateLimiter, upload.single("file"), async (req, res) => {
-  try {
-    const textContent = getRequestText(req.body);
-    const expiryHours = getRequestExpiryHours(req.body);
-    const uploadedFile = req.file;
+app.post(
+  "/api/clip",
+  createClipRateLimiter,
+  upload.fields([
+    { name: "file", maxCount: MAX_FILES_PER_CLIP },
+    { name: "files", maxCount: MAX_FILES_PER_CLIP },
+  ]),
+  async (req, res) => {
+    const uploadedCloudinaryFiles = [];
 
-    const hasText = textContent.length > 0;
-    const hasFile = Boolean(uploadedFile);
+    try {
+      const textContent = getRequestText(req.body);
+      const expiryHours = getRequestExpiryHours(req.body);
+      const uploadedFiles = getUploadedFiles(req);
 
-    if ((hasText && hasFile) || (!hasText && !hasFile)) {
-      return res.status(400).json({
-        error: "Provide exactly one of text content or file upload.",
-      });
-    }
+      const hasText = textContent.length > 0;
+      const hasFiles = uploadedFiles.length > 0;
 
-    if (hasFile && !isCloudinaryConfigured()) {
-      return res.status(503).json({
-        error: "File uploads are not configured on this server.",
-      });
-    }
+      if ((hasText && hasFiles) || (!hasText && !hasFiles)) {
+        return res.status(400).json({
+          error: "Provide exactly one of text content or file upload.",
+        });
+      }
 
-    const hours = parseExpiryHours(expiryHours);
-    if (hours === null) {
-      return res.status(400).json({
-        error: "expiryHours must be between 1 minute and 7 days.",
-      });
-    }
+      if (hasFiles && !isCloudinaryConfigured()) {
+        return res.status(503).json({
+          error: "File uploads are not configured on this server.",
+        });
+      }
 
-    const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
-    const code = await createUniqueCode();
+      const hours = parseExpiryHours(expiryHours);
+      if (hours === null) {
+        return res.status(400).json({
+          error: "expiryHours must be between 1 minute and 7 days.",
+        });
+      }
 
-    const clipData = {
-      code,
-      type: hasFile ? CLIP_TYPE.FILE : CLIP_TYPE.TEXT,
-      expiresAt,
-    };
+      const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
+      const code = await createUniqueCode();
 
-    if (hasFile) {
-      const cloudinaryResult = await uploadBufferToCloudinary(
-        uploadedFile.buffer,
-        uploadedFile.mimetype,
-        uploadedFile.originalname
-      );
-
-      clipData.file = {
-        filename: uploadedFile.originalname,
-        mimetype: uploadedFile.mimetype,
-        size: uploadedFile.size,
-        url: cloudinaryResult.secure_url,
-        publicId: cloudinaryResult.public_id,
-        resourceType: cloudinaryResult.resource_type ?? null,
+      const clipData = {
+        code,
+        type: hasFiles ? CLIP_TYPE.FILE : CLIP_TYPE.TEXT,
+        expiresAt,
       };
-    } else {
-      clipData.textContent = textContent;
+
+      if (hasFiles) {
+        const storedFiles = [];
+
+        for (const uploadedFile of uploadedFiles) {
+          // Upload sequentially so we can clean up partial progress if one file fails.
+          // eslint-disable-next-line no-await-in-loop
+          const cloudinaryResult = await uploadBufferToCloudinary(
+            uploadedFile.buffer,
+            uploadedFile.mimetype,
+            uploadedFile.originalname
+          );
+
+          const storedFile = {
+            filename: uploadedFile.originalname,
+            mimetype: uploadedFile.mimetype,
+            size: uploadedFile.size,
+            url: cloudinaryResult.secure_url,
+            publicId: cloudinaryResult.public_id,
+            resourceType: cloudinaryResult.resource_type ?? null,
+          };
+
+          uploadedCloudinaryFiles.push(storedFile);
+          storedFiles.push(storedFile);
+        }
+
+        clipData.file = storedFiles[0];
+        clipData.files = storedFiles;
+      } else {
+        clipData.textContent = textContent;
+      }
+
+      const clip = await Clip.create(clipData);
+      const clipFiles = getClipFiles(clip);
+      const primaryFile = clipFiles[0];
+
+      return res.status(201).json({
+        code: clip.code,
+        type: clip.type,
+        expiresAt: clip.expiresAt,
+        fileUrl: clip.type === CLIP_TYPE.FILE ? primaryFile?.url ?? null : null,
+        files:
+          clip.type === CLIP_TYPE.FILE
+            ? clipFiles.map((file) => formatFileResponse(file))
+            : [],
+      });
+    } catch (error) {
+      const filesToCleanup =
+        uploadedCloudinaryFiles.length > 0 ? uploadedCloudinaryFiles : [];
+
+      if (filesToCleanup.length > 0) {
+        await Promise.allSettled(
+          filesToCleanup.map((file) =>
+            destroyCloudinaryFile(file.publicId, file.resourceType)
+          )
+        );
+      }
+
+      console.error("Failed to create clip:", error.message);
+      return res.status(500).json({ error: "Failed to create clip." });
     }
-
-    const clip = await Clip.create(clipData);
-
-    return res.status(201).json({
-      code: clip.code,
-      type: clip.type,
-      expiresAt: clip.expiresAt,
-      fileUrl: clip.type === CLIP_TYPE.FILE ? clip.file.url : null,
-    });
-  } catch (error) {
-    console.error("Failed to create clip:", error.message);
-    return res.status(500).json({ error: "Failed to create clip." });
   }
-});
+);
 
 app.get("/api/clip/:code", fetchClipRateLimiter, async (req, res) => {
   try {
@@ -492,16 +612,15 @@ app.get("/api/clip/:code", fetchClipRateLimiter, async (req, res) => {
       });
     }
 
+    const clipFiles = getClipFiles(clip);
+    const primaryFile = clipFiles[0];
+
     return res.json({
       code: clip.code,
       type: clip.type,
-      fileUrl: clip.file.url,
-      file: {
-        filename: clip.file.filename,
-        mimetype: clip.file.mimetype,
-        size: clip.file.size,
-        url: clip.file.url,
-      },
+      fileUrl: primaryFile?.url ?? null,
+      file: formatFileResponse(primaryFile),
+      files: clipFiles.map((file) => formatFileResponse(file)),
       expiresAt: clip.expiresAt,
       createdAt: clip.createdAt,
     });
@@ -540,6 +659,12 @@ app.use((error, _req, res, next) => {
     if (error.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({
         error: `File size exceeds the ${MAX_UPLOAD_SIZE_MB} MB limit.`,
+      });
+    }
+
+    if (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({
+        error: `You can upload up to ${MAX_FILES_PER_CLIP} files at once.`,
       });
     }
 
