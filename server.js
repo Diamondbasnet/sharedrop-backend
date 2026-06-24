@@ -9,7 +9,7 @@ const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
-const corsOrigin = process.env.CORS_ORIGIN;
+const corsOrigin = process.env.CORS_ORIGIN || "https://diamondbasnet.github.io";
 const MAX_UPLOAD_SIZE_MB = Number(process.env.MAX_UPLOAD_SIZE_MB) || 25;
 const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 const MAX_FILES_PER_CLIP = Number(process.env.MAX_FILES_PER_CLIP) || 10;
